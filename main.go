@@ -1,13 +1,13 @@
 // ===================================================================================
-// XCELLATOR — High-Performance BFF (Backend-For-Frontend) Gateway
+// XCELERATOR — High-Performance BFF (Backend-For-Frontend) Gateway
 // ===================================================================================
 //
-// Xcellator is a lightweight, single-binary BFF layer built with Go + Fiber that sits
+// Xcelerator is a lightweight, single-binary BFF layer built with Go + Fiber that sits
 // between the APISIX API Gateway and the PeacockXTR Spring Boot backend. It replaces
 // the legacy PeacockBFF service.
 //
 // ┌──────────┐      ┌─────────┐      ┌────────────┐      ┌─────────────┐
-// │ Frontend │ ───▶ │ APISIX  │ ───▶ │ Xcellator  │ ───▶ │ PeacockXTR  │
+// │ Frontend │ ───▶ │ APISIX  │ ───▶ │ Xcelerator │ ───▶ │ PeacockXTR  │
 // │          │      │ Gateway │      │ (BFF:8081) │      │ (Core:8080) │
 // └──────────┘      └─────────┘      └────────────┘      └─────────────┘
 //
@@ -15,27 +15,38 @@
 // ──────────────────────
 // 1. APISIX handles JWT-to-UserId resolution (Lua plugin validates bearer token against
 //    Redis session store, strips Authorization header, injects X-User-Id & Custom-User-Id).
-//    Xcellator therefore does NOT re-validate JWT tokens — it trusts X-User-Id from APISIX.
+//    Xcelerator therefore does NOT re-validate JWT tokens in gateway mode — it trusts
+//    X-User-Id from APISIX (with a fallback direct-JWT mode for standalone testing).
 //
-// 2. Frontend sends two key headers:
+// 2. Frontend sends two key headers on BFF routes:
 //    - "Authorization: Bearer <JWT>" → consumed by APISIX, replaced with X-User-Id
-//    - "Idempotency: <UUID>"         → consumed by Xcellator for write-operation dedup
+//    - "Idempotency: <UUID>"         → consumed by Xcelerator for write-operation dedup
 //
-// 3. Xcellator's responsibilities:
+// 3. Xcelerator's responsibilities:
 //    a) Validate & transform the "Idempotency" header into "X-Idempotency-Key" for backend
-//    b) Deduplicate write requests via Redis SETNX (24h TTL)
+//    b) Deduplicate write requests via Redis SETNX (24h TTL) using composite key:
+//       IK::<UserId>::<BFF_URI>::<IdempotencyUUID>
 //    c) Passthrough X-User-Id and other internal headers to backend
 //    d) Reverse-proxy all /bff/* requests to PeacockXTR, stripping the /bff prefix
 //    e) Generate X-Request-Id (UUID) for distributed tracing
 //
-// 4. Route mapping: APISIX routes /bff/* → Xcellator:8081
-//    Xcellator strips /bff prefix and forwards to PeacockXTR:8080
-//    Example: /bff/api/v1/teams → /api/v1/teams
+// 4. APISIX 4-Route Architecture:
+//    - Route 1 (Priority 10): /api/auth/login, /api/auth/refresh, /api/minio/webhook
+//                             → Straight to PeacockXTR:8080 (Public, No Auth)
+//    - Route 2 (Priority 8) : /ws, /ws/*
+//                             → Straight to PeacockXTR:8080 (WebSocket + Sticky Session)
+//    - Route 3 (Priority 5) : /bff/*
+//                             → APISIX JWT Auth + Rate Limit → Xcelerator:8081 → PeacockXTR:8080
+//    - Route 4 (Priority 0) : /api/* (Used for PublicStorageController & PrivateStorageController)
+//                             → APISIX JWT Auth + Rate Limit → Straight to PeacockXTR:8080
 //
 // CONFIGURATION (Environment Variables):
 // ──────────────────────────────────────
 //   BACKEND_URL         — PeacockXTR base URL (default: http://peacock-app:8080)
+//   XTR_BASE_URL        — Legacy/Docker Compose alias for BACKEND_URL
 //   REDIS_ADDR          — Redis address for idempotency dedup (default: redis:6379)
+//   REDIS_HOST          — Redis hostname if REDIS_ADDR is not set (default: redis)
+//   REDIS_PORT          — Redis port if REDIS_ADDR is not set (default: 6379)
 //   REDIS_PASSWORD      — Redis password (default: empty)
 //   REDIS_DB            — Redis database number (default: 0)
 //   IDEMPOTENCY_TTL_HRS — Idempotency key TTL in hours (default: 24)
@@ -45,6 +56,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -69,27 +81,34 @@ import (
 // SECTION 1: CONFIGURATION
 // ===================================================================================
 
-// Config holds all runtime configuration for the Xcellator BFF service.
+// Config holds all runtime configuration for the Xcelerator BFF service.
 // Values are loaded from environment variables with sensible defaults for
 // containerized deployment alongside PeacockXTR and Redis.
 type Config struct {
-	BackendURL      string        // Base URL of PeacockXTR backend (e.g., http://peacock-app:8080)
-	RedisAddr       string        // Redis server address in host:port format
-	RedisPassword   string        // Redis authentication password (empty for no auth)
-	RedisDB         int           // Redis database index (0-15)
-	IdempotencyTTL  time.Duration // How long idempotency keys are retained in Redis
-	Port            string        // Port this BFF server listens on
+	BackendURL     string        // Base URL of PeacockXTR backend (e.g., http://peacock-app:8080)
+	RedisAddr      string        // Redis server address in host:port format
+	RedisPassword  string        // Redis authentication password (empty for no auth)
+	RedisDB        int           // Redis database index (0-15)
+	IdempotencyTTL time.Duration // How long idempotency keys are retained in Redis
+	Port           string        // Port this BFF server listens on
 }
 
 // LoadConfig reads configuration from environment variables.
 // Every field has a production-ready default value so the service can start
 // without any env vars in a standard Docker Compose deployment.
 func LoadConfig() Config {
-	redisDB, _ := strconv.Atoi(getEnv("REDIS_DB", "0"))
-	ttlHours, _ := strconv.Atoi(getEnv("IDEMPOTENCY_TTL_HRS", "24"))
+	redisDB, err := strconv.Atoi(getEnv("REDIS_DB", "0"))
+	if err != nil {
+		redisDB = 0
+	}
+
+	ttlHours, err := strconv.Atoi(getEnv("IDEMPOTENCY_TTL_HRS", "24"))
+	if err != nil || ttlHours <= 0 {
+		ttlHours = 24
+	}
 
 	// Support both BACKEND_URL and legacy/docker-compose XTR_BASE_URL
-	backendURL := getEnv("BACKEND_URL", getEnv("XTR_BASE_URL", "http://peacock-app:8080"))
+	backendURL := strings.TrimRight(getEnv("BACKEND_URL", getEnv("XTR_BASE_URL", "http://peacock-app:8080")), "/")
 
 	// Support both REDIS_ADDR and legacy/docker-compose REDIS_HOST + REDIS_PORT
 	redisHost := getEnv("REDIS_HOST", "redis")
@@ -108,8 +127,8 @@ func LoadConfig() Config {
 
 // getEnv returns the value of an environment variable or a fallback default.
 func getEnv(key, fallback string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		return val
+	if val, ok := os.LookupEnv(key); ok && strings.TrimSpace(val) != "" {
+		return strings.TrimSpace(val)
 	}
 	return fallback
 }
@@ -120,12 +139,17 @@ func getEnv(key, fallback string) string {
 
 // newRedisClient creates a go-redis client configured for the idempotency store.
 // The same Redis instance is used by APISIX for session/rate-limit, so we share
-// the infrastructure but use a dedicated key prefix ("idempotency:").
+// the infrastructure and use composite keys ("IK::<UserId>::<URI>::<UUID>").
 func newRedisClient(cfg Config) *redis.Client {
 	return redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-		DB:       cfg.RedisDB,
+		Addr:         cfg.RedisAddr,
+		Password:     cfg.RedisPassword,
+		DB:           cfg.RedisDB,
+		DialTimeout:  3 * time.Second,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		PoolSize:     50,
+		MinIdleConns: 10,
 	})
 }
 
@@ -141,7 +165,7 @@ func newHTTPClient() *http.Client {
 		MaxIdleConns:        200,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
-		TLSClientConfig:    &tls.Config{InsecureSkipVerify: false},
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
 	}
 	return &http.Client{
 		Transport: transport,
@@ -150,7 +174,7 @@ func newHTTPClient() *http.Client {
 }
 
 // ===================================================================================
-// SECTION 4: UUID VALIDATION
+// SECTION 4: UUID & JWT VALIDATION
 // ===================================================================================
 
 // uuidRegex validates that a string is a well-formed UUID v4 (or any UUID format).
@@ -158,6 +182,9 @@ func newHTTPClient() *http.Client {
 var uuidRegex = regexp.MustCompile(
 	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`,
 )
+
+// jwtRegex validates standard 3-part base64url JWT structure starting with "eyJ".
+var jwtRegex = regexp.MustCompile(`^eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_=]+$`)
 
 // ===================================================================================
 // SECTION 5: STANDARD ERROR RESPONSE
@@ -205,30 +232,29 @@ func sendError(c *fiber.Ctx, status int, errType, message string) error {
 // downstream to PeacockXTR.
 //
 // DUAL-MODE BEHAVIOR:
-// 1. Gateway Mode (Normal):
+// 1. Gateway Mode (Normal via APISIX Route 3):
 //    APISIX gateway executes Lua auth plugin, verifies JWT against Redis session store,
 //    injects X-User-Id & Custom-User-Id, and strips Authorization header.
-//    Xcellator detects pre-resolved X-User-Id and passes it straight through.
+//    Xcelerator detects pre-resolved X-User-Id and passes it straight through.
 //
 // 2. Direct / Standalone Mode (Fallback & Testing):
-//    If client sends "Authorization: Bearer <JWT>" directly to Xcellator (bypassing APISIX),
-//    Xcellator parses the token, queries the shared Redis session store
+//    If client sends "Authorization: Bearer <JWT>" directly to Xcelerator (bypassing APISIX),
+//    Xcelerator parses the token, queries the shared Redis session store
 //    ("peacockxt:session:token:<token>"), resolves the userId, and injects X-User-Id.
 //
 // SECURITY GUARANTEE:
 // Authorization header is NEVER forwarded downstream to PeacockXTR. Backend Core
 // relies entirely on the authenticated internal header X-User-Id.
-var jwtRegex = regexp.MustCompile(`^eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_=]+$`)
 
 func jwtAuthMiddleware(rdb *redis.Client) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		// 1. If X-User-Id was already resolved by APISIX, proceed immediately
-		if userId := c.Get("X-User-Id"); userId != "" {
+		if userID := strings.TrimSpace(c.Get("X-User-Id")); userID != "" {
 			return c.Next()
 		}
 
-		// 2. If Authorization header is provided directly by Frontend
-		authHeader := c.Get("Authorization")
+		// 2. If Authorization header is provided directly by Frontend (Standalone/Testing mode)
+		authHeader := strings.TrimSpace(c.Get("Authorization"))
 		if authHeader != "" {
 			parts := strings.SplitN(authHeader, " ", 2)
 			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
@@ -241,22 +267,22 @@ func jwtAuthMiddleware(rdb *redis.Client) fiber.Handler {
 				defer cancel()
 
 				redisKey := "peacockxt:session:token:" + token
-				userId, err := rdb.Get(ctx, redisKey).Result()
-				if err != nil || userId == "" {
+				userID, err := rdb.Get(ctx, redisKey).Result()
+				if err != nil || userID == "" {
 					return sendError(c, fiber.StatusUnauthorized, "Unauthorized", "Invalid or expired session token.")
 				}
 
-				// Inject resolved user ID for internal handlers and downstream backend
-				c.Request().Header.Set("X-User-Id", userId)
-				c.Request().Header.Set("Custom-User-Id", userId)
+				// Strip Authorization and inject resolved user ID for downstream backend
+				c.Request().Header.Del("Authorization")
+				c.Request().Header.Set("X-User-Id", userID)
+				c.Request().Header.Set("Custom-User-Id", userID)
 				return c.Next()
 			}
 			return sendError(c, fiber.StatusUnauthorized, "Unauthorized", "Invalid Bearer format.")
 		}
 
-		// Allow unauthenticated requests for public storage endpoints; protected
-		// endpoints will be guarded by backend or lack of X-User-Id
-		return c.Next()
+		// Reject unauthenticated requests (all /bff/* routes are protected)
+		return sendError(c, fiber.StatusUnauthorized, "Unauthorized", "Missing authentication credentials.")
 	}
 }
 
@@ -269,32 +295,43 @@ func jwtAuthMiddleware(rdb *redis.Client) fiber.Handler {
 // This is critical for operations like creating teams, sending messages, or
 // deleting resources where network retries could cause double-execution.
 //
-// FLOW:
-// 1. Frontend includes "Idempotency: <UUID>" header on every write request
-// 2. This middleware validates the UUID format
-// 3. Attempts Redis SETNX with key "idempotency:<uuid>" and 24h TTL
-// 4. If key already exists → 409 Conflict (duplicate request)
-// 5. If key is new → proceed and forward as "X-Idempotency-Key" to backend
+// REDIS KEY FORMAT:
+//   IK::<UserId>::<BFF_URI>::<IdempotencyUUID>
+//   Example: IK::105::/bff/api/v1/teams::550e8400-e29b-41d4-a716-446655440000
 //
-// NOTE: Read operations (GET) bypass this middleware entirely.
-// This mirrors the exact behavior of PeacockXTR's IdempotencyInterceptor.java
-// but is enforced at the BFF layer so the backend doesn't need to check again.
-// However, we still forward the header so backend can use it for its own logging.
+// WHY WE KEEP "/bff" IN THE REDIS KEY URI:
+//   Both Xcelerator (BFF) and PeacockXTR (Spring Boot) share the same Redis instance.
+//   Xcelerator forwards "X-Idempotency-Key" to PeacockXTR. If PeacockXTR's own
+//   IdempotencyInterceptor is also active, it checks "IK::<UserId>::/api/v1/...::<UUID>".
+//   Keeping "/bff" in Xcelerator's Redis key guarantees zero key-collision between
+//   the BFF layer and the Spring Boot layer!
+//
+// REDIS VALUE LIFECYCLE:
+//   1. On request arrival: SETNX key = "STARTED" with 24h TTL.
+//   2. If key already exists:
+//      - Value == "STARTED" -> 409 Conflict (Request is currently in-flight)
+//      - Value != "STARTED" -> 409 Conflict (Request was already completed earlier)
+//   3. On completion (after proxyHandler returns):
+//      - If HTTP status >= 400 or network error -> DEL key (allows client to retry)
+//      - If HTTP status < 400 (2xx/3xx)         -> SET key = "<StatusCode>" with KeepTTL
 
 func idempotencyMiddleware(rdb *redis.Client, ttl time.Duration) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		method := c.Method()
 
 		// ── Skip read operations ──────────────────────────────────────
-		// GET and HEAD requests are inherently idempotent; no dedup needed.
+		// GET, HEAD, and OPTIONS requests are inherently idempotent; no dedup needed.
 		if method == fiber.MethodGet || method == fiber.MethodHead || method == fiber.MethodOptions {
 			return c.Next()
 		}
 
 		// ── Extract Idempotency header from frontend ──────────────────
-		// Frontend sends "Idempotency: <UUID>" (not "X-Idempotency-Key").
-		// The BFF transforms this into the backend's expected header format.
-		idempotencyKey := c.Get("Idempotency")
+		// Frontend sends "Idempotency: <UUID>" (also accepts "X-Idempotency-Key" as fallback).
+		// The BFF transforms this into the backend's expected "X-Idempotency-Key" header.
+		idempotencyKey := strings.TrimSpace(c.Get("Idempotency"))
+		if idempotencyKey == "" {
+			idempotencyKey = strings.TrimSpace(c.Get("X-Idempotency-Key"))
+		}
 		if idempotencyKey == "" {
 			return sendError(c, fiber.StatusBadRequest, "Bad Request",
 				"Missing Idempotency header. All write operations require a UUID idempotency key.")
@@ -309,52 +346,71 @@ func idempotencyMiddleware(rdb *redis.Client, ttl time.Duration) fiber.Handler {
 		}
 
 		// ── Build composite Redis key ─────────────────────────────────
-		// Backend's IdempotencyInterceptor uses key format: IK::[UserId]::[URI]::[IdempotencyKey]
-		// This ensures the same idempotency key can be reused across different
-		// users and different endpoints without collision.
-		userId := c.Get("X-User-Id", "anonymous")
+		// Format: IK::[UserId]::[URI]::[IdempotencyKey]
+		// Keeps c.Path() (e.g., /bff/api/v1/teams) so it never collides with
+		// Spring Boot's internal IdempotencyInterceptor key (/api/v1/teams).
+		userID := c.Get("X-User-Id", "anonymous")
 		uri := c.Path() // e.g., /bff/api/v1/teams
-		redisKey := fmt.Sprintf("IK::%s::%s::%s", userId, uri, idempotencyKey)
+		redisKey := fmt.Sprintf("IK::%s::%s::%s", userID, uri, idempotencyKey)
 
 		// ── Redis SETNX for deduplication ─────────────────────────────
 		// Uses SET with NX (Not eXists) flag. If the key already exists,
-		// this means the same request was already processed → reject as duplicate.
-		// TTL ensures keys are cleaned up automatically after 24 hours.
-		ctx := context.Background()
+		// this means the same request is in progress or was already processed.
+		lockCtx, lockCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		wasSet, err := rdb.SetNX(lockCtx, redisKey, "STARTED", ttl).Result()
+		lockCancel()
 
-		wasSet, err := rdb.SetNX(ctx, redisKey, "STARTED", ttl).Result()
 		if err != nil {
-			// Redis failure should not block requests — log and proceed.
-			// In production, consider circuit-breaker patterns here.
+			// Redis failure should not block requests — log and proceed (fail-open).
 			log.Printf("[WARN] Redis idempotency check failed: %v — allowing request through", err)
 			c.Request().Header.Set("X-Idempotency-Key", idempotencyKey)
 			return c.Next()
 		}
 
 		if !wasSet {
-			// Key already exists — check if it's still in-progress or completed
-			existingVal, _ := rdb.Get(ctx, redisKey).Result()
+			// Key already exists — check if it's still in-progress ("STARTED") or completed
+			checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			existingVal, _ := rdb.Get(checkCtx, redisKey).Result()
+			checkCancel()
+
 			if existingVal == "STARTED" {
 				// Request is still being processed (concurrent duplicate)
 				return sendError(c, fiber.StatusConflict, "Conflict",
 					"Request is already in progress. Please wait for the original request to complete.")
 			}
-			// Request was already completed — return cached status info
+			// Request was already completed — reject duplicate
 			return sendError(c, fiber.StatusConflict, "Conflict",
 				"Duplicate request detected. This idempotency key has already been used.")
 		}
 
-		// ── Store Redis key in locals for afterCompletion logic ────────
-		// We store the key so the response handler can update it with the
-		// final HTTP status or delete it on failure (allowing retry).
-		c.Locals("idempotencyRedisKey", redisKey)
-
 		// ── Transform header for backend ──────────────────────────────
 		// Backend expects "X-Idempotency-Key", not "Idempotency".
-		// We set it on the outgoing request context for the proxy handler.
 		c.Request().Header.Set("X-Idempotency-Key", idempotencyKey)
 
-		return c.Next()
+		// ── Execute downstream proxy handler ──────────────────────────
+		handlerErr := c.Next()
+
+		// ── Idempotency afterCompletion logic ─────────────────────────
+		// Mirrors PeacockXTR's IdempotencyInterceptor.afterCompletion:
+		// - If the backend returned an error (>= 400) or proxy failed, DELETE the Redis key
+		//   so the client can retry with the same idempotency key.
+		// - If the backend returned success (< 400), UPDATE the Redis value
+		//   to the final HTTP status code while preserving the existing 24h TTL (redis.KeepTTL).
+		statusCode := c.Response().StatusCode()
+		afterCtx, afterCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer afterCancel()
+
+		if handlerErr != nil || statusCode >= 400 {
+			if delErr := rdb.Del(afterCtx, redisKey).Err(); delErr != nil {
+				log.Printf("[WARN] Failed to delete idempotency key %s after error: %v", redisKey, delErr)
+			}
+		} else {
+			if setErr := rdb.Set(afterCtx, redisKey, strconv.Itoa(statusCode), redis.KeepTTL).Err(); setErr != nil {
+				log.Printf("[WARN] Failed to update idempotency key %s with status %d: %v", redisKey, statusCode, setErr)
+			}
+		}
+
+		return handlerErr
 	}
 }
 
@@ -362,7 +418,7 @@ func idempotencyMiddleware(rdb *redis.Client, ttl time.Duration) fiber.Handler {
 // SECTION 8: REVERSE PROXY HANDLER
 // ===================================================================================
 //
-// The core of Xcellator: a generic reverse proxy that forwards all requests from
+// The core of Xcelerator: a generic reverse proxy that forwards all requests from
 // the BFF to PeacockXTR. This is NOT a simple TCP proxy — it's an application-level
 // proxy that:
 //
@@ -387,10 +443,8 @@ func idempotencyMiddleware(rdb *redis.Client, ttl time.Duration) fiber.Handler {
 //   - X-Idempotency-Key  → Transformed from frontend's "Idempotency" header
 //   - X-Request-Id       → Generated by BFF for distributed tracing
 //   - Content-Type       → Required for request body parsing
+//   - Accept             → Standard content negotiation header
 
-// headersToForward defines the allowlist of headers that are proxied from the
-// BFF request to the PeacockXTR backend. Each header serves a specific purpose
-// in the backend's request processing pipeline.
 var headersToForward = []string{
 	"X-User-Id",         // Authenticated user ID (resolved from JWT by APISIX)
 	"Custom-User-Id",    // Alias of X-User-Id (used by APISIX rate limiter)
@@ -400,6 +454,7 @@ var headersToForward = []string{
 	"X-Idempotency-Key", // Idempotency key for write-operation deduplication
 	"X-Request-Id",      // Distributed tracing correlation ID
 	"Content-Type",      // MIME type of request body (application/json)
+	"Accept",            // MIME type accepted by client
 }
 
 // proxyHandler creates a Fiber handler that reverse-proxies requests to the
@@ -407,25 +462,26 @@ var headersToForward = []string{
 // to strip from incoming request paths before forwarding.
 //
 // Example: pathPrefix="/bff" transforms /bff/api/v1/teams → /api/v1/teams
-func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string, rdb *redis.Client) fiber.Handler {
+func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		// ── Build downstream URL ──────────────────────────────────────
 		// Strip the BFF prefix and reconstruct the full backend URL.
 		// Fiber's c.OriginalURL() includes query parameters.
 		originalPath := c.OriginalURL() // e.g., /bff/api/v1/teams?teamIds=1,2
 		downstreamPath := strings.TrimPrefix(originalPath, pathPrefix)
-		if downstreamPath == "" {
-			downstreamPath = "/"
+		if downstreamPath == "" || !strings.HasPrefix(downstreamPath, "/") {
+			downstreamPath = "/" + downstreamPath
 		}
 		targetURL := backendURL + downstreamPath
 
 		// ── Create downstream HTTP request ────────────────────────────
 		var bodyReader io.Reader
-		if len(c.Body()) > 0 {
-			bodyReader = strings.NewReader(string(c.Body()))
+		rawBody := c.Body()
+		if len(rawBody) > 0 {
+			bodyReader = bytes.NewReader(rawBody)
 		}
 
-		req, err := http.NewRequestWithContext(c.Context(), c.Method(), targetURL, bodyReader)
+		req, err := http.NewRequestWithContext(c.UserContext(), c.Method(), targetURL, bodyReader)
 		if err != nil {
 			log.Printf("[ERROR] Failed to create proxy request: %v", err)
 			return sendError(c, fiber.StatusInternalServerError, "Internal Server Error",
@@ -439,6 +495,26 @@ func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string,
 			if val := c.Get(header); val != "" {
 				req.Header.Set(header, val)
 			}
+		}
+
+		// Ensure headers injected by middlewares onto c.Request().Header are forwarded
+		if ik := string(c.Request().Header.Peek("X-Idempotency-Key")); ik != "" {
+			req.Header.Set("X-Idempotency-Key", ik)
+		}
+		if uid := string(c.Request().Header.Peek("X-User-Id")); uid != "" {
+			req.Header.Set("X-User-Id", uid)
+		}
+		if cuid := string(c.Request().Header.Peek("Custom-User-Id")); cuid != "" {
+			req.Header.Set("Custom-User-Id", cuid)
+		}
+
+		// Propagate X-Request-Id generated by Fiber's requestid middleware
+		reqID, _ := c.Locals("requestId").(string)
+		if reqID == "" {
+			reqID = c.Get("X-Request-Id")
+		}
+		if reqID != "" {
+			req.Header.Set("X-Request-Id", reqID)
 		}
 
 		// Ensure Content-Type is set for requests with body
@@ -462,9 +538,8 @@ func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string,
 
 		// Copy response headers (excluding hop-by-hop headers)
 		for key, values := range resp.Header {
-			// Skip hop-by-hop headers that shouldn't be forwarded
 			lowerKey := strings.ToLower(key)
-			if lowerKey == "transfer-encoding" || lowerKey == "connection" {
+			if lowerKey == "transfer-encoding" || lowerKey == "connection" || lowerKey == "keep-alive" {
 				continue
 			}
 			for _, v := range values {
@@ -473,7 +548,7 @@ func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string,
 		}
 
 		// Preserve the X-Request-Id in the response for frontend tracing
-		if reqID := c.Get("X-Request-Id"); reqID != "" {
+		if reqID != "" {
 			c.Response().Header.Set("X-Request-Id", reqID)
 		}
 
@@ -483,23 +558,6 @@ func proxyHandler(backendURL string, httpClient *http.Client, pathPrefix string,
 			log.Printf("[ERROR] Failed to read backend response body: %v", err)
 			return sendError(c, fiber.StatusBadGateway, "Bad Gateway",
 				"Failed to read response from backend service.")
-		}
-
-		// ── Idempotency afterCompletion logic ─────────────────────────
-		// Mirrors PeacockXTR's IdempotencyInterceptor.afterCompletion:
-		// - If the backend returned an error (>= 400), DELETE the Redis key
-		//   so the client can retry with the same idempotency key.
-		// - If the backend returned success (< 400), UPDATE the Redis value
-		//   to the final HTTP status code (caching the result).
-		if redisKey, ok := c.Locals("idempotencyRedisKey").(string); ok && redisKey != "" {
-			ctx := context.Background()
-			if resp.StatusCode >= 400 {
-				// Backend rejected the request → allow client to retry
-				rdb.Del(ctx, redisKey)
-			} else {
-				// Backend accepted → cache the status code
-				rdb.Set(ctx, redisKey, strconv.Itoa(resp.StatusCode), 0) // keep existing TTL
-			}
 		}
 
 		c.Status(resp.StatusCode)
@@ -535,7 +593,7 @@ func healthHandler(rdb *redis.Client) fiber.Handler {
 		}
 
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"service":   "xcellator",
+			"service":   "xcelerator",
 			"status":    "UP",
 			"timestamp": time.Now().UTC().Format(time.RFC3339),
 			"version":   "1.0.0",
@@ -553,74 +611,67 @@ func healthHandler(rdb *redis.Client) fiber.Handler {
 //   2. Initialize Redis client for idempotency deduplication
 //   3. Initialize HTTP client for backend proxying
 //   4. Create Fiber app with production settings
-//   5. Register global middleware (recovery, logging, request-id)
+//   5. Register global middleware (recovery, request-id, logging)
 //   6. Register the /health endpoint (no auth required)
-//   7. Register the /bff/* catch-all route group with idempotency middleware
+//   7. Register the /bff/* route group with JWT + idempotency middleware
 //   8. Start the HTTP server on the configured port
 //
 // ROUTE STRUCTURE:
 // ────────────────
 // All BFF-proxied traffic enters through /bff/* which maps to APISIX's
-// "bff-protected-route". The BFF strips /bff and proxies to PeacockXTR.
-//
-// The following PeacockXTR endpoints are accessible through the BFF:
+// "bff-protected-route" (Route 3). The BFF strips /bff and proxies to PeacockXTR.
 //
 // ┌─────────────────────────────────────────────────────────────────────────────────────┐
 // │ DOMAIN          │ BFF PATH (→ Backend Path)                    │ METHODS           │
 // ├─────────────────┼──────────────────────────────────────────────┼───────────────────┤
-// │ Auth            │ /bff/api/auth/setting-avatar                │ POST              │
-// │                 │ /bff/api/auth/delete-avatar                 │ DELETE            │
+// │ Auth            │ /bff/api/auth/setting-avatar                 │ POST              │
+// │                 │ /bff/api/auth/delete-avatar                  │ DELETE            │
 // │                 │                                              │                   │
-// │ Teams           │ /bff/api/v1/teams                           │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:teamId                   │ PUT, DELETE       │
+// │ Teams           │ /bff/api/v1/teams                            │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:teamId                    │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Channels        │ /bff/api/v1/teams/:id/channels              │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:id/channels/:cId         │ PUT, DELETE       │
+// │ Channels        │ /bff/api/v1/teams/:id/channels               │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:id/channels/:cId          │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Posts           │ /bff/api/v1/teams/:id/posts                 │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:id/posts/:pId            │ GET, PUT, DELETE  │
+// │ Posts           │ /bff/api/v1/teams/:id/posts                  │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:id/posts/:pId             │ GET, PUT, DELETE  │
 // │                 │                                              │                   │
-// │ Messages        │ /bff/api/v1/channels/:id/messages           │ GET, POST         │
-// │                 │ /bff/api/v1/channels/:id/messages/:mId      │ PUT, DELETE       │
+// │ Messages        │ /bff/api/v1/channels/:id/messages            │ GET, POST         │
+// │                 │ /bff/api/v1/channels/:id/messages/:mId       │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Comments        │ /bff/api/v1/posts/:id/comments              │ GET, POST         │
-// │                 │ /bff/api/v1/posts/:id/comments/:cId         │ PUT, DELETE       │
+// │ Comments        │ /bff/api/v1/posts/:id/comments               │ GET, POST         │
+// │                 │ /bff/api/v1/posts/:id/comments/:cId          │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Memberships     │ /bff/api/v1/users/me/memberships            │ GET               │
-// │                 │ /bff/api/v1/teams/:id/memberships           │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:id/memberships/me        │ GET               │
-// │                 │ /bff/api/v1/teams/:id/memberships/:mId      │ PUT, DELETE       │
+// │ Memberships     │ /bff/api/v1/users/me/memberships             │ GET               │
+// │                 │ /bff/api/v1/teams/:id/memberships            │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:id/memberships/me         │ GET               │
+// │                 │ /bff/api/v1/teams/:id/memberships/:mId       │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Events          │ /bff/api/v1/teams/:id/events                │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:id/events/:eId           │ DELETE            │
+// │ Events          │ /bff/api/v1/teams/:id/events                 │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:id/events/:eId            │ DELETE            │
 // │                 │                                              │                   │
-// │ Emojis          │ /bff/api/v1/teams/:id/emojis                │ GET, POST         │
-// │                 │ /bff/api/v1/teams/:id/emojis/:name          │ DELETE            │
+// │ Emojis          │ /bff/api/v1/teams/:id/emojis                 │ GET, POST         │
+// │                 │ /bff/api/v1/teams/:id/emojis/:name           │ DELETE            │
 // │                 │                                              │                   │
-// │ Direct Messages │ /bff/api/v1/private-sessions                │ POST              │
-// │                 │ /bff/api/v1/private-sessions/:id/messages   │ GET, POST         │
-// │                 │ /bff/api/v1/private-sessions/:id/msgs/:mId  │ PUT, DELETE       │
+// │ Direct Messages │ /bff/api/v1/private-sessions                 │ POST              │
+// │                 │ /bff/api/v1/private-sessions/:id/messages    │ GET, POST         │
+// │                 │ /bff/api/v1/private-sessions/:id/messages/:m │ PUT, DELETE       │
 // │                 │                                              │                   │
-// │ Private Session │ /bff/api/v1/users/me/private-sessions       │ GET               │
-// │                 │ /bff/api/v1/users/me/private-sessions/with/:id │ GET            │
-// │                 │                                              │                   │
-// │ Public Storage  │ /bff/api/v1/public-storage/upload-policy    │ GET               │
-// │                 │ /bff/api/v1/public-storage/download-url     │ GET               │
-// │                 │ /bff/api/v1/public-storage/delete-url       │ GET               │
-// │                 │                                              │                   │
-// │ Private Storage │ /bff/api/v1/private-storage/upload-policy   │ GET               │
-// │                 │ /bff/api/v1/private-storage/download-url    │ GET               │
-// │                 │ /bff/api/v1/private-storage/delete-url      │ GET               │
-// │                 │ /bff/api/v1/private-storage/batch-download  │ POST              │
+// │ Private Session │ /bff/api/v1/users/me/private-sessions        │ GET               │
+// │                 │ /bff/api/v1/users/me/private-sessions/with/: │ GET               │
 // └─────────────────────────────────────────────────────────────────────────────────────┘
 //
-// NOTE: Public endpoints (login, refresh, minio webhook) are routed DIRECTLY to
-// PeacockXTR by APISIX (Route 1) and never pass through Xcellator.
+// DIRECT ROUTES (Bypass Xcelerator BFF via APISIX):
+// ─────────────────────────────────────────────────
+// - Route 1 (Public): /api/auth/login, /api/auth/refresh, /api/minio/webhook
+// - Route 2 (WS)    : /ws, /ws/*
+// - Route 4 (Direct): /api/v1/public-storage/*, /api/v1/private-storage/*
+//                     (Protected by APISIX JWT Lua plugin, goes straight to PeacockXTR)
 
 func main() {
 	// ── Step 1: Load Configuration ────────────────────────────────────
 	cfg := LoadConfig()
-	log.Printf("[INFO] Xcellator BFF starting with config: backend=%s redis=%s port=%s",
+	log.Printf("[INFO] Xcelerator BFF starting with config: backend=%s redis=%s port=%s",
 		cfg.BackendURL, cfg.RedisAddr, cfg.Port)
 
 	// ── Step 2: Initialize Redis Client ───────────────────────────────
@@ -638,7 +689,7 @@ func main() {
 
 	// ── Step 4: Create Fiber Application ──────────────────────────────
 	app := fiber.New(fiber.Config{
-		AppName:               "Xcellator BFF v1.0.0",
+		AppName:               "Xcelerator BFF v1.0.0",
 		DisableStartupMessage: false,
 		ReadTimeout:           15 * time.Second,
 		WriteTimeout:          30 * time.Second,
@@ -700,7 +751,7 @@ func main() {
 	// Each route is documented with its business purpose, required headers,
 	// and the downstream PeacockXTR endpoint it maps to.
 
-	proxy := proxyHandler(cfg.BackendURL, httpClient, "/bff", rdb)
+	proxy := proxyHandler(cfg.BackendURL, httpClient, "/bff")
 
 	// ───────────────────────────────────────────────────────────────────
 	// AUTH ENDPOINTS (Protected — requires X-User-Id from APISIX)
@@ -1049,69 +1100,16 @@ func main() {
 	bff.Post("/api/v1/private-sessions", proxy)
 
 	// ───────────────────────────────────────────────────────────────────
-	// PUBLIC STORAGE ENDPOINTS
-	// Pre-signed URL generation for public MinIO bucket operations.
-	// Used for team avatars, emojis, and other public assets.
+	// PUBLIC & PRIVATE STORAGE ENDPOINTS (MOVED TO APISIX ROUTE 4)
+	// /api/v1/public-storage/* and /api/v1/private-storage/* are routed
+	// directly from APISIX (Route 4) to PeacockXTR after JWT verification,
+	// bypassing Xcelerator BFF so read-like batch POST requests do not
+	// require Idempotency keys.
 	// ───────────────────────────────────────────────────────────────────
-
-	// GET /bff/api/v1/public-storage/upload-policy?objectName=...
-	// Business: Generates a pre-signed upload policy for the public bucket.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/public-storage/upload-policy
-	// Response: { "<field>": "<value>" } — pre-signed form data
-	bff.Get("/api/v1/public-storage/upload-policy", proxy)
-
-	// GET /bff/api/v1/public-storage/download-url?objectName=...
-	// Business: Generates a pre-signed download URL for a public object.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/public-storage/download-url
-	// Response: { "url": "<pre-signed-url>" }
-	bff.Get("/api/v1/public-storage/download-url", proxy)
-
-	// GET /bff/api/v1/public-storage/delete-url?objectName=...
-	// Business: Generates a pre-signed delete URL for a public object.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/public-storage/delete-url
-	// Response: { "url": "<pre-signed-url>" }
-	bff.Get("/api/v1/public-storage/delete-url", proxy)
-
-	// ───────────────────────────────────────────────────────────────────
-	// PRIVATE STORAGE ENDPOINTS
-	// Pre-signed URL generation for private MinIO bucket operations.
-	// Used for file attachments in messages and DMs.
-	// ───────────────────────────────────────────────────────────────────
-
-	// GET /bff/api/v1/private-storage/upload-policy?objectName=...
-	// Business: Generates a pre-signed upload policy for the private bucket.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/private-storage/upload-policy
-	// Response: { "<field>": "<value>" } — pre-signed form data
-	bff.Get("/api/v1/private-storage/upload-policy", proxy)
-
-	// GET /bff/api/v1/private-storage/download-url?objectName=...
-	// Business: Generates a pre-signed download URL for a private object.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/private-storage/download-url
-	// Response: { "url": "<pre-signed-url>" }
-	bff.Get("/api/v1/private-storage/download-url", proxy)
-
-	// GET /bff/api/v1/private-storage/delete-url?objectName=...
-	// Business: Generates a pre-signed delete URL for a private object.
-	// Query: objectName (required)
-	// Backend: GET /api/v1/private-storage/delete-url
-	// Response: { "url": "<pre-signed-url>" }
-	bff.Get("/api/v1/private-storage/delete-url", proxy)
-
-	// POST /bff/api/v1/private-storage/batch-download-urls
-	// Business: Generates pre-signed download URLs for multiple private objects at once.
-	// Body: { "objectNames": ["file1.jpg", "file2.pdf", ...] }
-	// Backend: POST /api/v1/private-storage/batch-download-urls
-	// Response: { "file1.jpg": "<url>", "file2.pdf": "<url>", ... }
-	bff.Post("/api/v1/private-storage/batch-download-urls", proxy)
 
 	// ── Step 8: Start Server ──────────────────────────────────────────
 	listenAddr := fmt.Sprintf(":%s", cfg.Port)
-	log.Printf("[INFO] Xcellator BFF is ready — listening on %s", listenAddr)
+	log.Printf("[INFO] Xcelerator BFF is ready — listening on %s", listenAddr)
 	if err := app.Listen(listenAddr); err != nil {
 		log.Fatalf("[FATAL] Server failed to start: %v", err)
 	}
