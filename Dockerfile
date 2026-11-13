@@ -66,7 +66,7 @@ EXPOSE 8081
 
 # Health check — polls the /health endpoint every 30 seconds
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost:8081/health || exit 1
+    CMD wget -qO- http://127.0.0.1:8081/health || exit 1
 
 # Run the application
 ENTRYPOINT ["./xcellator"]
